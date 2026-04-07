@@ -78,7 +78,7 @@ The `session` intent establishes a unidirectional
 streaming payment channel using on-chain escrow and
 off-chain signed vouchers. This enables high-frequency,
 low-cost payments by batching many off-chain voucher
-updates into periodic on-chain settlement.
+updates into on-chain settlement at channel close.
 
 Unlike the `charge` intent, which settles a full
 on-chain transaction per request, the `session` intent
@@ -154,8 +154,8 @@ This specification leverages Solana-specific capabilities:
      |  (10) close (final        |                  |
      |        voucher)           |                  |
      |-------------------------> |                  |
-     |                           | (11) settle +    |
-     |                           |      refund      |
+     |                           | (11) distribute  |
+     |                           |      + refund    |
      |                           |----------------> |
      |  (12) 204 + Receipt       |                  |
      |<------------------------- |                  |
@@ -187,9 +187,9 @@ encoding conventions.
 
 Payment Channel
 : A unidirectional payment relationship between a payer
-  and payee, consisting of an on-chain escrow account
-  managed by a channel program and a sequence of
-  off-chain vouchers. The channel is identified by a
+  and an operator, consisting of an on-chain escrow
+  account managed by a channel program and a sequence
+  of off-chain vouchers. The channel is identified by a
   unique `channelId`.
 
 Channel Program
@@ -198,6 +198,26 @@ Channel Program
   The program address is declared in the challenge so
   clients can verify they are interacting with the
   expected program.
+
+Operator
+: The party that manages the payment channel on behalf
+  of the service. The operator opens, settles, and
+  closes the channel. The operator is typically the
+  server but is not necessarily the payment recipient.
+
+Recipient
+: The primary destination for settled funds at channel
+  close. The recipient receives the settled amount minus
+  the sum of any splits. In the simplest case the
+  operator and recipient may be the same party.
+
+Split
+: A fixed-amount payment leg distributed at channel
+  close to a designated address. Splits are optional
+  and can be used for platform fees, revenue sharing,
+  or referral commissions. Each split specifies a
+  recipient address, a fixed amount, and an optional
+  memo.
 
 Voucher
 : A signed message authorizing a cumulative payment
@@ -208,7 +228,7 @@ Cumulative Amount
 : The total amount authorized from channel open, not a
   per-request delta. For example, if the first voucher
   authorizes 100 and the second authorizes 250, the
-  payee may claim up to 250 total, not 350.
+  operator may claim up to 250 total, not 350.
 
 Authorized Signer
 : The key permitted to sign vouchers for a channel.
@@ -217,7 +237,7 @@ Authorized Signer
 
 Grace Period
 : A time window after a client requests forced close,
-  during which the server can still settle outstanding
+  during which the operator can still settle outstanding
   vouchers before funds are returned to the client.
 
 # Intent Identifier
@@ -241,17 +261,19 @@ MUST implement.
 ## Channel State
 
 Each channel is represented by an on-chain account
-(typically a PDA derived from payer, payee, asset,
+(typically a PDA derived from payer, operator, asset,
 and a salt) with the following logical fields:
 
 | Field | Type | Storage | Description |
 |-------|------|---------|-------------|
 | `payer` | Pubkey | Seed + Account state | Client who deposited funds |
-| `payee` | Pubkey | Seed + Account state | Server authorized to settle |
+| `operator` | Pubkey | Seed + Account state | Party authorized to settle and close |
+| `recipient` | Pubkey | Account state | Primary destination for settled funds at close |
 | `token` | Pubkey | Seed only | Token mint |
 | `authorizedSigner` | Pubkey | Seed + Account state | Voucher signer (payer if not delegated) |
+| `splits` | Vec | Account state | Fixed-amount payment legs distributed at close (may be empty) |
 | `deposit` | u64 | Account state | Total amount deposited |
-| `settled` | u64 | Account state | Cumulative amount settled to payee |
+| `settled` | u64 | Account state | Cumulative amount settled (watermark) |
 | `closeRequestedAt` | i64 | Account state | Unix timestamp of close request (0 if none) |
 | `bump` | u8 | Account state | Canonical PDA bump |
 
@@ -262,11 +284,15 @@ parameters and the program ID. At minimum, the seed
 set MUST bind the PDA to:
 
 - the payer public key;
-- the payee public key;
+- the operator public key;
 - the asset identifier (SOL or mint address);
 - a client-chosen salt or nonce; and
 - the authorized signer public key (or payer if no
   delegation is used).
+
+The `recipient`, `splits`, and other variable fields
+are stored in the channel account state and validated
+at open time. They are NOT part of the PDA seed set.
 
 Clients and servers MUST derive the expected
 `channelId` from the channel program ID and the seed
@@ -308,24 +334,25 @@ mint state before constructing the open transaction.
 
 ### settle
 
-Payee presents a signed voucher. The program verifies
-the Ed25519 signature (via Solana's `ed25519` program
-or in-program verification), checks that
+Operator presents a signed voucher. The program
+verifies the Ed25519 signature (via Solana's `ed25519`
+program or in-program verification), checks that
 `cumulativeAmount > settled` and
-`cumulativeAmount <= deposit`, then transfers the
-delta (`cumulativeAmount - settled`) to the payee.
+`cumulativeAmount <= deposit`, then updates the
+on-chain `settled` watermark to `cumulativeAmount`.
 
-The server MAY call settle at any time to claim
-accumulated funds without closing the channel.
+The settle instruction does NOT transfer tokens. It
+advances the settlement watermark so that the settled
+amount is protected against forced close: if the payer
+calls `requestClose` followed by `withdraw`, only
+`deposit - settled` is refundable. All token transfers
+occur at channel close (see {{close-instruction}}).
 
-The payee authority for settlement MUST be a signer on
-the transaction.
+The operator MAY call settle at any time to advance
+the watermark without closing the channel.
 
-If the token mint has a Token-2022 transfer hook
-extension, the token transfer instruction MUST include
-the extra accounts required by the hook program.
-Servers MUST resolve current hook extra accounts from
-on-chain mint state before building this transaction.
+The operator authority for settlement MUST be a signer
+on the transaction.
 
 ### topUp
 
@@ -341,7 +368,7 @@ MUST be a signer on the transaction.
 
 Payer initiates a forced close. The program sets
 `closeRequestedAt = Clock::get().unix_timestamp`.
-This starts a grace period during which the payee
+This starts a grace period during which the operator
 can still call settle or close.
 
 The payer authority requesting close MUST be a signer
@@ -352,8 +379,16 @@ on the transaction.
 Payer recovers remaining funds after the grace
 period has expired. The program verifies
 `Clock::get().unix_timestamp >= closeRequestedAt + GRACE_PERIOD`,
-transfers `deposit - settled` to the payer, and
-marks the channel as finalized.
+distributes the `settled` amount to the recipient
+and split addresses (same distribution rules as
+close), transfers `deposit - settled` to the payer,
+and marks the channel as finalized.
+
+If `settled < sum(split amounts)`, the withdraw
+instruction MUST fail. In this case the payer and
+operator must coordinate a cooperative close or the
+operator must first call settle to advance the
+watermark to a sufficient level.
 
 The payer authority receiving the refund MUST be a
 signer on the transaction.
@@ -365,24 +400,42 @@ realloc the account data to 8 bytes, write the
 between the pre-close rent-exempt balance and the 8-byte
 tombstone rent-exempt minimum to the payer.
 
-### close
+### close {#close-instruction}
 
-Payee closes the channel by settling any final delta
-authorized by a voucher and refunding the remainder to
-the payer in a single atomic transaction. If no new
-delta exists beyond the on-chain `settled` watermark,
-the close path MAY omit voucher verification and act
-as a refund-only cooperative close.
+Operator closes the channel by settling any final
+delta authorized by a voucher, distributing the
+settled amount to the recipient and split addresses,
+and refunding the remainder to the payer — all in a
+single atomic transaction. If no new delta exists
+beyond the on-chain `settled` watermark, the close
+path MAY omit voucher verification and proceed with
+distribution and refund only.
+
+The close instruction MUST distribute the total
+`settled` amount as follows:
+
+1. Each split receives its fixed `amount`.
+2. The primary `recipient` receives
+   `settled - sum(split amounts)`.
+3. The payer receives `deposit - settled` as a refund.
+
+If `settled < sum(split amounts)`, the close
+instruction MUST fail. Implementations SHOULD
+ensure at open time that the minimum economically
+useful deposit exceeds the total split obligation.
+
+When no splits are configured, the full `settled`
+amount is transferred to the `recipient`.
 
 Solana's multi-instruction transactions allow the
-settle + refund + account cleanup to happen
-atomically, ensuring neither party can be cheated
-during close.
+distribution + refund + account cleanup to happen
+atomically, ensuring no party can be cheated during
+close.
 
-The payee authority initiating cooperative close MUST
-be a signer on the transaction. Fee-payer signatures
-MUST NOT be treated as satisfying payer or payee
-authority checks.
+The operator authority initiating cooperative close
+MUST be a signer on the transaction. Fee-payer
+signatures MUST NOT be treated as satisfying payer or
+operator authority checks.
 
 On completion, the `close` instruction MUST NOT
 fully deallocate the channel account. The program MUST
@@ -392,32 +445,35 @@ between the pre-close rent-exempt balance and the 8-byte
 tombstone rent-exempt minimum to the payer.
 
 If the token mint has a Token-2022 transfer hook
-extension, the token transfer instruction MUST include
-the extra accounts required by the hook program.
-Servers MUST resolve current hook extra accounts from
-on-chain mint state before building this transaction.
+extension, each token transfer instruction MUST
+include the extra accounts required by the hook
+program. Servers MUST resolve current hook extra
+accounts from on-chain mint state before building
+this transaction.
 
 ## Grace Period
 
 The grace period (RECOMMENDED: 15 minutes) protects
-the payee. If the payer calls requestClose while the
-payee has unsubmitted vouchers, the payee has until
-the grace period expires to call settle or close.
+the operator (and by extension, the recipient and
+split recipients). If the payer calls requestClose
+while the operator has unsubmitted vouchers, the
+operator has until the grace period expires to call
+settle or close.
 
 Without a grace period, the payer could withdraw
 funds immediately after receiving service, before
-the server has time to settle.
+the operator has time to settle and close.
 
 ## Access Control
 
 | Instruction | Caller |
 |-------------|--------|
 | open | Anyone (payer signs the deposit transfer) |
-| settle | Payee only |
+| settle | Operator only |
 | topUp | Payer only |
 | requestClose | Payer only |
 | withdraw | Payer only (after grace period) |
-| close | Payee only |
+| close | Operator only |
 
 # Request Schema
 
@@ -437,8 +493,17 @@ suggestedDeposit
   expected usage.
 
 recipient
-: REQUIRED. Base58-encoded public key of the server's
-  account that will receive settlement funds.
+: REQUIRED. Base58-encoded public key of the primary
+  payment recipient. This is the account that receives
+  the settled amount minus the sum of any splits at
+  channel close. The recipient is stored in the channel
+  account state at open time.
+
+operator
+: REQUIRED. Base58-encoded public key of the party
+  authorized to settle and close the channel. This is
+  typically the server. The operator is a PDA seed
+  component.
 
 currency
 : REQUIRED. Base58-encoded SPL token mint address.
@@ -503,6 +568,37 @@ ttlSeconds
 gracePeriodSeconds
 : OPTIONAL. Grace period for forced close
   (RECOMMENDED: 900, i.e. 15 minutes).
+
+splits
+: OPTIONAL. An array of at most 8 fixed-amount payment
+  legs distributed at channel close. Each entry is a
+  JSON object with the following fields:
+
+  - `recipient` (REQUIRED): Base58-encoded public key
+    of the split recipient.
+  - `amount` (REQUIRED): Fixed amount in the same base
+    units and asset as the primary payment.
+  - `memo` (OPTIONAL): Human-readable label for this
+    split (e.g., "platform fee", "referral"). MUST NOT
+    exceed 566 bytes (Solana Memo Program limit).
+
+  When present, the channel program stores the splits
+  in the channel account state at open time and
+  enforces them at close. The primary `recipient`
+  receives `settled - sum(split amounts)`; this
+  remainder MUST be greater than zero. Servers MUST
+  reject challenges where splits would consume the
+  entire settled amount. If the same recipient appears
+  more than once in `splits`, each occurrence is a
+  distinct payment leg; servers MUST NOT implicitly
+  aggregate such entries.
+
+  Splits are distributed only at channel close (or
+  forced withdraw), not during intermediate settle
+  operations. This mechanism mirrors the splits
+  extension defined in the Solana charge intent and
+  can be used for platform fees, revenue sharing, or
+  referral commissions.
 
 For the `session` intent, `amount` specifies the price
 per unit of service, not a total charge. When
@@ -740,7 +836,7 @@ When `feePayer` is `true` in the challenge:
 - **TopUp**: Same pattern — client partially signs,
   server co-signs.
 
-- **Settle/Close**: The server initiates these
+- **Settle/Close**: The operator initiates these
   operations and always pays the fee.
 
 This ensures clients never need SOL for transaction
@@ -793,19 +889,20 @@ For each request on an open channel:
 ## Partial Settlement
 
 The server MAY call the channel program's settle
-instruction at any time to claim accumulated funds
-without closing the channel. This is useful for:
+instruction at any time to advance the on-chain
+watermark without closing the channel. This is useful
+for:
 
+- Protecting earned revenue against forced close
 - Reducing counterparty risk on long-running sessions
-- Freeing up server working capital
 - Periodic reconciliation
 
 After settlement, the channel account's `settled`
-field on-chain reflects
-the claimed amount. The server MUST update
-`settledOnChain` after confirmation and continues
-accepting vouchers for amounts above the new settled
-baseline.
+field on-chain reflects the watermark amount. No
+tokens are transferred until close. The server MUST
+update `settledOnChain` after confirmation and
+continues accepting vouchers for amounts above the
+new settled baseline.
 
 ## Crash Safety
 
@@ -860,7 +957,7 @@ idempotent request.
    channel program instructions (create PDA +
    initialize channel + deposit transfer).
 2. Recompute the expected PDA from the transaction's
-   payer, payee, asset, authorized signer, salt, and
+   payer, operator, asset, authorized signer, salt, and
    channel program ID. Verify it equals the declared
    `channelId`.
 3. Verify the transaction's fee payer matches the
@@ -877,7 +974,9 @@ idempotent request.
    Otherwise: broadcast as-is.
 6. Verify channel state on-chain after confirmation:
    - payer matches transaction signer;
-   - payee matches the challenged recipient;
+   - operator matches the challenged operator;
+   - recipient matches the challenged recipient;
+   - splits match the challenged splits (if any);
    - token/asset matches the challenge currency;
    - deposit matches the requested amount;
    - authorized signer matches the open parameters;
@@ -914,10 +1013,16 @@ idempotent request.
 ## Close (Cooperative)
 
 1. If a final voucher is provided and authorizes an
-   amount above `settledOnChain`, verify it.
-2. Build and broadcast a close transaction:
-   settle any final delta + refund remainder
-   (atomic).
+   amount above `settledOnChain`, verify it and update
+   the watermark.
+2. Build and broadcast a close transaction that
+   atomically:
+   - transfers each split's fixed amount to its
+     recipient;
+   - transfers `settled - sum(split amounts)` to the
+     primary recipient;
+   - refunds `deposit - settled` to the payer; and
+   - finalizes the channel account.
 3. Mark channel as `"closed"`.
 4. Persist final `settledOnChain` and terminal
    accounting state after confirmation.
@@ -930,13 +1035,18 @@ force-close the channel:
 
 1. Client calls requestClose on the channel program.
 2. Grace period begins (RECOMMENDED: 15 minutes).
-3. During the grace period, the server MAY still
-   call settle with the latest voucher.
-4. After the grace period, the client calls withdraw
-   to recover `deposit - settled`.
+3. During the grace period, the operator MAY still
+   call settle (to advance the watermark) or close
+   (to distribute and finalize).
+4. After the grace period, the client calls withdraw.
+   The withdraw instruction distributes the `settled`
+   amount to the recipient and split addresses, then
+   refunds `deposit - settled` to the payer.
 
 This ensures the client can always recover unspent
-funds, even if the server disappears.
+funds, even if the operator disappears. The recipient
+and split recipients also receive their share of any
+amount that was settled before the forced close.
 
 # Receipt Format
 
@@ -958,9 +1068,11 @@ include:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `txHash` | string | Settlement transaction signature |
-| `spent` | string | Total amount settled |
-| `refunded` | string | Amount refunded to client |
+| `txHash` | string | Close transaction signature |
+| `settled` | string | Total amount settled |
+| `recipientAmount` | string | Amount transferred to primary recipient |
+| `splits` | array | Amounts transferred to each split recipient |
+| `refunded` | string | Amount refunded to payer |
 
 For streaming responses, servers SHOULD include the
 receipt in the initial response headers and SHOULD
@@ -1002,10 +1114,13 @@ All communication MUST use TLS 1.2 or higher.
 ## Escrow Safety
 
 Funds are held by the channel program, not the
-server. The server can only claim funds by presenting
-valid voucher signatures to the program. The client
-can always recover unspent funds via forced close
-after the grace period.
+operator. The operator can only trigger fund
+distribution by presenting valid voucher signatures
+to the program at close time. The client can always
+recover unspent funds via forced close after the
+grace period. All token transfers (to the recipient,
+split addresses, and payer refund) occur atomically
+at channel close.
 
 ## Voucher Replay Protection
 
@@ -1030,22 +1145,24 @@ settlements never exceed the deposit.
 ## Grace Period Security
 
 The grace period prevents a race condition where the
-payer withdraws before the server can settle. Without
-it, a malicious payer could use the service, then
-immediately withdraw. The server has the grace period
-to submit any outstanding vouchers.
+payer withdraws before the operator can settle and
+close. Without it, a malicious payer could use the
+service, then immediately withdraw. The operator has
+the grace period to advance the watermark and close
+the channel, ensuring the recipient and split
+addresses receive their funds.
 
 TopUp cancels pending close requests, preventing a
 grief attack where the payer requests close
 repeatedly to disrupt the session.
 
-Servers MUST stop accepting new service vouchers once
-`closeRequestedAt` is set. During the grace period,
-the server MAY use the latest previously accepted
-voucher to settle or cooperatively close the channel,
-but SHOULD NOT continue serving new metered content
-unless the close request is cancelled by a confirmed
-top-up.
+Operators MUST stop accepting new service vouchers
+once `closeRequestedAt` is set. During the grace
+period, the operator MAY use the latest previously
+accepted voucher to settle or cooperatively close
+the channel, but SHOULD NOT continue serving new
+metered content unless the close request is cancelled
+by a confirmed top-up.
 
 ## Delegated Signer Risks
 
@@ -1097,13 +1214,87 @@ implementations MUST validate the expected owner for:
 - the channel PDA account;
 - any escrow SOL or token-holding account;
 - any mint account referenced by the channel; and
-- any payer or payee token account used for settlement
-  or refund.
+- any payer, recipient, or split recipient token
+  account used for distribution or refund.
 
 Servers performing off-chain verification SHOULD also
 verify account ownership and program ownership against
 RPC state before accepting an open, top-up, settle, or
 close flow as valid.
+
+## Operator Trust Model
+
+The operator manages the channel on behalf of the
+recipient and split recipients. The operator controls
+when to call settle (advancing the watermark) and
+close (triggering distribution). The recipient and
+split recipients have no on-chain mechanism to force
+distribution — they depend entirely on the operator
+to close the channel.
+
+This trust model is appropriate for platform or
+marketplace scenarios where the operator has an
+off-chain contractual relationship with the recipient.
+Implementations SHOULD document this trust assumption
+clearly for all parties.
+
+A malicious or compromised operator could:
+
+- Delay close indefinitely, withholding earned funds
+  from the recipient and split recipients.
+- Close with a stale voucher (not the highest accepted
+  one), reducing the total distributed. The payer is
+  unaffected (they authorized up to the cumulative
+  amount), but the recipient receives less than earned.
+
+The on-chain program cannot prevent these behaviors
+because it has no knowledge of which voucher is
+"latest" — it only verifies that the presented
+voucher is valid and advances the watermark. Off-chain
+monitoring and dispute resolution are the appropriate
+mitigations.
+
+## Recipient Agency
+
+The primary recipient has no on-chain authority over
+the channel. Unlike the payer (who can force-close via
+`requestClose` + `withdraw`) and the operator (who
+can `settle` and `close`), the recipient cannot
+initiate any channel instruction.
+
+If the operator disappears without closing, the payer
+will eventually force-close and call withdraw, which
+distributes the settled amount to the recipient and
+split addresses. However, if the operator also failed
+to advance the watermark, the settled amount may be
+zero and the recipient receives nothing.
+
+Implementations MAY extend the channel program to
+grant the recipient a `requestClose` right as an
+additional safeguard, but this is outside the scope
+of this specification.
+
+## Split Distribution Safety
+
+Splits are fixed amounts stored in channel state at
+open time. The close and withdraw instructions MUST
+fail if `settled < sum(split amounts)`, because the
+primary recipient's share
+(`settled - sum(split amounts)`) would be negative.
+
+To avoid stuck channels:
+
+- Servers SHOULD validate at challenge time that the
+  expected minimum session usage exceeds the total
+  split obligation.
+- Channel programs SHOULD enforce at open time that
+  the initial deposit exceeds the total split
+  obligation.
+- If a channel's settled amount cannot cover splits
+  (e.g., due to a very short session), the operator
+  MUST advance the watermark via settle before
+  closing, or the payer and operator must coordinate
+  a top-up.
 
 ## Channel Exhaustion
 
