@@ -17,6 +17,10 @@ author:
     ins: Desormeaux
     email: jo.desormeaux@solana.org
     org: Solana Foundation
+  - name: Michael Assaf
+    ins: M. Assaf
+    email: michael@moonsonglabs.com
+    org: Moonsong Labs
 
 normative:
   RFC2119:
@@ -668,6 +672,18 @@ confirmed on-chain. This keeps the open path
 focused on channel construction and avoids burning
 on-chain compute on a signature for a single
 request's worth of authorization.
+
+`Action: "open"` MUST NOT carry a `bump` field. The
+channel PDA's canonical bump is derived on-chain via
+`find_program_address` and validated by the program's
+direct address check, so any wire-supplied bump is
+redundant. Servers MUST reject open envelopes that
+include a `bump` field using the `malformed-credential`
+problem type. Silently accepting and ignoring a wire
+`bump` is forbidden because a client whose derivation
+is buggy can compute a wrong bump that nonetheless
+pairs with the canonical PDA address — a mismatch the
+on-chain address check cannot catch.
 
 Servers MUST derive `payer`, `channelId`,
 `depositAmount`, `authorizationPolicy`, delegated signer
