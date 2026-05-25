@@ -313,7 +313,8 @@ set MUST bind the PDA to:
 
 - the payer public key;
 - the payee public key;
-- the mint address (native SOL is unsupported);
+- the mint address (native SOL is unsupported; see
+  {{native-sol}});
 - a client-chosen salt or nonce; and
 - the authorized signer public key (or payer if no
   delegation is used).
@@ -546,7 +547,10 @@ recipient
 
 currency
 : REQUIRED. Base58-encoded SPL token mint address.
-  Native SOL is not supported; clients wishing to pay
+  See {{native-sol}}.
+
+Native SOL {#native-sol}
+: Native SOL is not supported; clients wishing to pay
   in SOL MUST wrap it to wSOL
   (`So11111111111111111111111111111111111111112`)
   before opening a channel.
