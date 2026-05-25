@@ -298,7 +298,7 @@ logical fields:
 | `paidOut` | u64 | Account state | Cumulative amount already distributed to the merchant side; `paidOut <= settled` |
 | `closureStartedAt` | i64 | Account state | Unix timestamp when `requestClose` was called (0 if not set; cleared on `Finalized`) |
 | `payerWithdrawnAt` | i64 | Account state | Unix timestamp of the payer refund (0 if not yet); guards against double-refund when both `withdrawPayer` and `distribute` can pay the payer |
-| `gracePeriod` | u32 | Account state | Seconds between `requestClose` and permissionless `finalize`. Per-channel, set at `open`, so a single program deployment can host channels with differing dispute windows |
+| `gracePeriod` | u32 | Account state | Non-zero seconds between `requestClose` and permissionless `finalize`. Per-channel, set at `open`, so a single program deployment can host channels with differing dispute windows |
 | `distributionHash` | [u8;32] | Account state | Hash digest of the canonical splits preimage committed at `open`; `distribute` MUST re-verify this hash before paying recipients |
 | `payer` | Pubkey | Seed + Account state | Client who deposited funds |
 | `payee` | Pubkey | Seed + Account state | Server authorized to settle; receives the implicit-remainder share on `distribute` |
@@ -313,8 +313,7 @@ set MUST bind the PDA to:
 
 - the payer public key;
 - the payee public key;
-- the mint address (native SOL is unsupported; see
-  {{native-sol}});
+- the mint address (native SOL is unsupported);
 - a client-chosen salt or nonce; and
 - the authorized signer public key (or payer if no
   delegation is used).
@@ -344,7 +343,7 @@ signer.
 |-----------|------|-------------|
 | `salt` | u64 | PDA disambiguator |
 | `deposit` | u64 | Initial deposit in base units; MUST be non-zero |
-| `gracePeriod` | u32 | Forced-close grace period in seconds; stored per-channel |
+| `gracePeriod` | u32 | Forced-close grace period in seconds; stored per-channel; MUST be non-zero |
 | `distributionSplits` | `(Pubkey, u16)[]` | Splits preimage; canonical encoding hashed into `distributionHash` (see {{splits-canonicalization}}) |
 
 `open` MUST reject the instruction when the target
@@ -358,6 +357,9 @@ which lists the derived channel PDA as a recipient.
 Mints carrying Token-2022 extensions outside the
 allow-list (see {{token-extension-policy}}) MUST be
 rejected.
+
+The `gracePeriod` parameter MUST be non-zero. Channel
+programs MUST reject `gracePeriod == 0`.
 
 `open` does NOT carry an initial voucher; the first
 voucher is exchanged off-chain after confirmation.
@@ -544,10 +546,10 @@ recipient
 
 currency
 : REQUIRED. Base58-encoded SPL token mint address.
-  Native SOL is not supported (see {{native-sol}});
-  clients wishing to pay in SOL MUST wrap it to wSOL
+  Native SOL is not supported; clients wishing to pay
+  in SOL MUST wrap it to wSOL
   (`So11111111111111111111111111111111111111112`)
-  before opening a channel. {#native-sol}
+  before opening a channel.
 
 description
 : OPTIONAL. Human-readable description of the service
@@ -603,9 +605,10 @@ ttlSeconds
 : OPTIONAL. Suggested session duration in seconds.
 
 gracePeriodSeconds
-: OPTIONAL. Grace period for forced close
-  (RECOMMENDED: 900). Stored per-channel in
-  `Channel.gracePeriod` at `open`.
+: Conditionally REQUIRED. Grace period for forced close
+  when `channelId` is absent (RECOMMENDED: 900).
+  Stored per-channel in `Channel.gracePeriod` at
+  `open`. The value MUST be greater than zero.
 
 distributionSplits
 : OPTIONAL. Ordered list of `{recipient, shareBps}`
@@ -652,7 +655,7 @@ Opens a new payment channel.
 | `authorizedSigner` | string | REQUIRED | Base58 public key bound into the PDA seeds as the voucher signer; equals `payer` when no delegation is used |
 | `salt` | string | REQUIRED | Decimal u64 PDA disambiguator |
 | `depositAmount` | string | REQUIRED | Initial deposit in base units; MUST satisfy `depositAmount >= methodDetails.minimumDeposit` |
-| `gracePeriodSeconds` | integer | REQUIRED | Grace-period seconds bound into channel state at `open`; MUST match `methodDetails.gracePeriodSeconds` (or the server-policy default) |
+| `gracePeriodSeconds` | integer | REQUIRED | Grace-period seconds bound into channel state at `open`; MUST be greater than zero and MUST match `methodDetails.gracePeriodSeconds` (or the server-policy default) |
 | `distributionSplits` | array | OPTIONAL | Splits preimage (see `methodDetails.distributionSplits`); MUST byte-match the splits proposed in the 402 challenge |
 | `authorizationPolicy` | object | OPTIONAL | Voucher signer policy. When present, MUST be consistent with `authorizedSigner` |
 | `transaction` | string | REQUIRED | Base64-encoded (standard alphabet, padded) signed or partially signed transaction |
@@ -686,17 +689,18 @@ pairs with the canonical PDA address — a mismatch the
 on-chain address check cannot catch.
 
 Servers MUST derive `payer`, `channelId`,
-`depositAmount`, `authorizationPolicy`, delegated signer
-settings, the distribution splits commitment, and
-all other program-relevant open parameters from the
-signed transaction and confirmed on-chain state.
-Servers MUST NOT trust these values solely because
-they appear in the HTTP payload. Servers MUST also
-strictly validate that the on-chain `distributionSplits`,
-`payee`, and `mint` exactly match what was proposed
-in the 402 challenge; failing to do so allows a
-malicious client to redirect the merchant-side
-payout.
+`depositAmount`, `gracePeriodSeconds`,
+`authorizationPolicy`, delegated signer settings, and
+the distribution splits commitment from the signed
+transaction and confirmed on-chain state. Servers MUST
+NOT trust these values solely because they appear in
+the HTTP payload. Servers MUST also strictly validate
+that the on-chain `distributionSplits`, `payee`,
+`mint`, and `gracePeriod` exactly match what was
+proposed in the 402 challenge and carried in the open
+payload; failing to do so allows a malicious client
+to redirect the merchant-side payout or shorten the
+forced-close window.
 
 ## Action: "voucher"
 
@@ -1111,34 +1115,39 @@ idempotent request.
    payer, payee, mint, authorized signer, and salt
    plus the channel program ID. Verify it equals the
    declared `channelId`.
-3. Verify the transaction's fee payer matches the
+3. Verify the credential's `gracePeriodSeconds` equals
+   the challenge policy and is greater than zero.
+   Decode the open instruction and verify its
+   `gracePeriod` equals the same value.
+4. Verify the transaction's fee payer matches the
    challenge policy:
    - if `feePayer` is `true`, the fee payer MUST equal
      `feePayerKey`;
    - otherwise the payer funds the transaction.
-4. Verify the transaction does not include unrelated
+5. Verify the transaction does not include unrelated
    writable accounts or instructions that could
    redirect funds or mutate channel parameters.
    The server SHOULD reject transactions that route
    value through unexpected external programs.
-5. Verify `depositAmount >= methodDetails.minimumDeposit`
+6. Verify `depositAmount >= methodDetails.minimumDeposit`
    (when set) and that the on-chain `distributionHash`
    matches the digest of the canonical preimage of
    the splits proposed in the 402 challenge.
-6. If fee payer mode: co-sign and broadcast.
+7. If fee payer mode: co-sign and broadcast.
    Otherwise: broadcast as-is.
-7. Verify channel state on-chain after confirmation:
+8. Verify channel state on-chain after confirmation:
    - payer matches transaction signer;
    - payee matches the challenged recipient;
    - mint matches the challenge currency;
    - deposit matches the requested amount;
+   - `gracePeriod` is non-zero and matches the
+     challenge policy;
    - authorized signer matches the open parameters;
-   - `gracePeriod` matches the challenge policy;
    - `distributionHash` matches the proposed splits;
    - channel is not finalized; and
    - `closureStartedAt` is `0`.
-8. Create server-side channel state.
-9. Return 200 with receipt.
+9. Create server-side channel state.
+10. Return 200 with receipt.
 
 ## Voucher Update (No Settlement)
 
@@ -1300,6 +1309,12 @@ payer withdraws before the server can settle. Without
 it, a malicious payer could use the service, then
 immediately withdraw. The server has the grace period
 to submit any outstanding vouchers.
+
+Servers MUST verify that a new channel uses the
+challenged `gracePeriodSeconds`. If the transaction
+sets a zero or shorter grace period, the payer could
+request close and recover funds before the server has
+time to settle accepted vouchers.
 
 Because `topUp` MUST NOT clear `closureStartedAt`,
 servers MUST guard the equivalent grief vector at
