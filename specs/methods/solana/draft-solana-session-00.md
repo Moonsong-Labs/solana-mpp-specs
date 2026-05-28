@@ -702,8 +702,8 @@ before signing, paying fees, or broadcasting. Servers
 MUST reject `Action: "open"` credentials when the
 challenge, HTTP payload, decoded transaction, derived
 PDA, escrow ATA, token program, or confirmed on-chain
-state disagree. The Open settlement procedure defines
-the required decoding and validation sequence.
+state disagree. See {{open-settlement}} for the
+required decoding and validation sequence.
 
 ## Action: "voucher"
 
@@ -817,7 +817,7 @@ bytes are signed via the JSON. The same layout is
 the on-chain argument for `settle` and (without the
 `hasVoucher` byte) for `settleAndFinalize`.
 
-## Voucher Verification
+## Voucher Verification {#voucher-verification}
 
 The server MUST verify each voucher:
 
@@ -1108,7 +1108,7 @@ idempotent request.
 
 # Settlement Procedure
 
-## Open
+## Open {#open-settlement}
 
 1. Decode the open transaction before signing, paying
    fees, or broadcasting. Verify it contains the
@@ -1202,8 +1202,8 @@ is requested, the paths forward are
 ## Close (Cooperative) {#close-cooperative}
 
 1. If a final voucher is provided, verify the
-   `SignedVoucher` per Voucher Verification for the
-   active channel. The voucher MUST also satisfy
+   `SignedVoucher` for the active channel per
+   {{voucher-verification}}. The voucher MUST also satisfy
    `settled < cumulativeAmount <= deposit` before
    `settleAndFinalize`.
 2. Build and broadcast `settleAndFinalize`. The
