@@ -699,31 +699,11 @@ on-chain address check cannot catch.
 Servers MUST treat the decoded `transaction`, not the
 HTTP envelope, as the authoritative open request
 before signing, paying fees, or broadcasting. Servers
-MUST decode the channel instruction and verify that it
-targets `methodDetails.channelProgram`, uses the
-`open` discriminator, and encodes the same `payer`,
-`payee`, `mint`, `authorizedSigner`, `salt`, `deposit`,
-`grace_period`, and canonical `distributionSplits`
-preimage carried in the credential and the 402
-challenge.
-
-Servers MUST recompute `channelId` from the decoded
-seed fields and channel program ID, verify that it
-equals both the decoded channel account and the
-payload `channelId`, and verify that the decoded
-escrow account is the associated token account for
-`(channelId, mint, tokenProgram)`. The decoded
-`tokenProgram` MUST match the challenged token program
-when one was supplied; otherwise it MUST be one of the
-supported token programs for the mint.
-
-Any disagreement between the challenge, HTTP payload,
-decoded transaction, derived PDA, escrow ATA, or
-confirmed on-chain state MUST be rejected. Failing to
-do so allows a malicious client to redirect the
-merchant-side payout, shorten the forced-close window,
-underfund escrow, or cause the server to meter a
-different channel than the one it challenged.
+MUST reject `Action: "open"` credentials when the
+challenge, HTTP payload, decoded transaction, derived
+PDA, escrow ATA, token program, or confirmed on-chain
+state disagree. The Open settlement procedure defines
+the required decoding and validation sequence.
 
 ## Action: "voucher"
 
@@ -853,9 +833,10 @@ The server MUST verify each voucher:
    channel PDA.
 
 5. Verify `cumulativeAmount > acceptedCumulative`
-   using the server's durable watermark, unless the
-   submission is an idempotent retry handled per
-   "Concurrency and Idempotency".
+   using the server's durable watermark, even when
+   on-chain `settled` lags. The only exception is an
+   idempotent retry handled per "Concurrency and
+   Idempotency".
 
 6. Verify the channel account discriminator is not
    `ClosedChannel` (i.e., the channel has not been
@@ -877,11 +858,6 @@ The server MUST verify each voucher:
 
 10. Persist the new `acceptedCumulative` amount to
     durable storage BEFORE serving the resource.
-
-The on-chain `settled` watermark is not a substitute
-for `acceptedCumulative` during metered service.
-Servers MUST reject non-increasing vouchers even when
-on-chain settlement lags behind accepted service.
 
 ## On-Chain Voucher Verification
 
@@ -1226,14 +1202,10 @@ is requested, the paths forward are
 ## Close (Cooperative) {#close-cooperative}
 
 1. If a final voucher is provided, verify the
-   `SignedVoucher` against the active channel:
-   `voucher.channelId` equals the payload `channelId`,
-   `signer` equals the channel `authorizedSigner`, the
-   Ed25519 signature verifies over the Borsh payload,
-   freshness checks pass, and
-   `settled < cumulativeAmount <= deposit`. The same
-   `acceptedCumulative` rules used for voucher updates
-   apply.
+   `SignedVoucher` per Voucher Verification for the
+   active channel. The voucher MUST also satisfy
+   `settled < cumulativeAmount <= deposit` before
+   `settleAndFinalize`.
 2. Build and broadcast `settleAndFinalize`. The
    server SHOULD bundle `distribute` in the same
    transaction so the merchant-side payout, payer
@@ -1347,6 +1319,8 @@ derivation. The channel address MUST be bound to the
 channel program ID and channel open parameters so that
 vouchers cannot be replayed across different channel
 program deployments or different Solana clusters.
+
+## Open Transaction Binding
 
 Servers that sponsor or submit open transactions MUST
 treat the decoded transaction contents as the
