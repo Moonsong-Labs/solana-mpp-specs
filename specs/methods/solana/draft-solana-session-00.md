@@ -348,7 +348,7 @@ signer.
 |-----------|------|-------------|
 | `salt` | u64 | PDA disambiguator |
 | `deposit` | u64 | Initial deposit in base units; MUST be non-zero |
-| `gracePeriod` | u32 | Forced-close grace period in seconds; stored per-channel; MUST be non-zero |
+| `gracePeriod` | u32 | Forced-close grace period in seconds; stored per-channel; encoded as `grace_period`; MUST be non-zero |
 | `distributionSplits` | `(Pubkey, u16)[]` | Splits preimage; canonical encoding hashed into `distributionHash` (see {{splits-canonicalization}}) |
 
 `open` MUST reject the instruction when the target
@@ -364,7 +364,9 @@ allow-list (see {{token-extension-policy}}) MUST be
 rejected.
 
 The `gracePeriod` parameter MUST be non-zero. Channel
-programs MUST reject `gracePeriod == 0`.
+programs MUST reject `grace_period == 0`. The
+reference program reports `GracePeriodMustBeNonZero`
+(code `201`) for this rejection.
 
 `open` does NOT carry an initial voucher; the first
 voucher is exchanged off-chain after confirmation.
@@ -551,13 +553,10 @@ recipient
 
 currency
 : REQUIRED. Base58-encoded SPL token mint address.
-  See {{native-sol}}.
-
-Native SOL {#native-sol}
-: Native SOL is not supported; clients wishing to pay
+  Native SOL is not supported; clients wishing to pay
   in SOL MUST wrap it to wSOL
   (`So11111111111111111111111111111111111111112`)
-  before opening a channel.
+  before opening a channel. {#native-sol}
 
 description
 : OPTIONAL. Human-readable description of the service
@@ -663,7 +662,7 @@ Opens a new payment channel.
 | `authorizedSigner` | string | REQUIRED | Base58 public key bound into the PDA seeds as the voucher signer; MAY equal `payer` or a delegated signer |
 | `salt` | string | REQUIRED | Decimal u64 PDA disambiguator |
 | `depositAmount` | string | REQUIRED | Initial deposit in base units; MUST equal the decoded `open` deposit and satisfy `depositAmount >= methodDetails.minimumDeposit` |
-| `gracePeriodSeconds` | integer | REQUIRED | Grace-period seconds bound into channel state at `open`; MUST be greater than zero and MUST match `methodDetails.gracePeriodSeconds` (or the server-policy default) |
+| `gracePeriodSeconds` | integer | REQUIRED | Grace-period seconds bound into channel state at `open`; MUST be greater than zero and MUST match `methodDetails.gracePeriodSeconds` |
 | `distributionSplits` | array | OPTIONAL | Splits preimage (see `methodDetails.distributionSplits`); MUST byte-match the splits proposed in the 402 challenge |
 | `authorizationPolicy` | object | OPTIONAL | Voucher signer policy. When present, MUST be consistent with `authorizedSigner` |
 | `transaction` | string | REQUIRED | Base64-encoded (standard alphabet, padded) signed or partially signed transaction |
@@ -834,9 +833,10 @@ The server MUST verify each voucher:
 
 5. Verify `cumulativeAmount > acceptedCumulative`
    using the server's durable watermark, even when
-   on-chain `settled` lags. The only exception is an
-   idempotent retry handled per "Concurrency and
-   Idempotency".
+   on-chain `settled` lags. Equal or lower amounts
+   MUST be rejected for metered voucher acceptance
+   unless they are exact idempotent replays handled
+   per "Concurrency and Idempotency".
 
 6. Verify the channel account discriminator is not
    `ClosedChannel` (i.e., the channel has not been
@@ -1088,17 +1088,17 @@ MUST be processed atomically with respect to:
 - `spentAmount`; and
 - `closureStartedAt`.
 
-Servers MUST treat voucher submissions idempotently:
+Servers MUST treat metered requests idempotently:
 
-- Resubmitting a voucher with the same
-  `cumulativeAmount` as the highest accepted voucher
-  MUST succeed and MUST NOT change channel state.
-- Submitting a voucher with lower `cumulativeAmount`
-  than the highest accepted voucher SHOULD return the
-  current receipt state and MUST NOT reduce channel
-  state.
+- Replaying an already processed request MAY return
+  the cached receipt and MUST NOT change channel state
+  or deliver additional service.
+- Voucher submissions with `cumulativeAmount <=
+  acceptedCumulative` and no matching cached
+  idempotent response MUST be rejected and MUST NOT
+  reduce channel state.
 - Clients MAY safely retry voucher submissions after
-  network failures.
+  network failures using the same idempotency key.
 
 Clients SHOULD include an `Idempotency-Key` header on
 metered HTTP requests. Servers SHOULD cache
@@ -1112,7 +1112,8 @@ idempotent request.
 
 1. Decode the open transaction before signing, paying
    fees, or broadcasting. Verify it contains the
-   expected channel program `open` instruction (the
+   expected channel program instruction and that the
+   instruction uses the `open` discriminator (the
    reference implementation composes channel-PDA
    creation, escrow ATA creation, deposit transfer,
    and the `distributionHash` commitment in a single
@@ -1202,10 +1203,12 @@ is requested, the paths forward are
 ## Close (Cooperative) {#close-cooperative}
 
 1. If a final voucher is provided, verify the
-   `SignedVoucher` for the active channel per
-   {{voucher-verification}}. The voucher MUST also satisfy
-   `settled < cumulativeAmount <= deposit` before
-   `settleAndFinalize`.
+   `SignedVoucher` against the active channel:
+   `voucher.channelId` equals the payload `channelId`,
+   `signer` equals the channel `authorizedSigner`, the
+   Ed25519 signature verifies over the Borsh payload,
+   freshness checks pass, and
+   `settled < cumulativeAmount <= deposit`.
 2. Build and broadcast `settleAndFinalize`. The
    server SHOULD bundle `distribute` in the same
    transaction so the merchant-side payout, payer
