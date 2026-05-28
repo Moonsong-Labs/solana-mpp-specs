@@ -255,8 +255,8 @@ This specification uses two distinct encoding regimes:
    base64url-encoded {{RFC4648}} without padding.
 
 2. **On-chain signed-payload encoding.** The bytes
-   the payer's Ed25519 key signs to authorize spend
-   are produced by Borsh-encoding the on-chain
+   the channel's `authorizedSigner` signs to authorize
+   spend are produced by Borsh-encoding the on-chain
    `Voucher` struct (see {{on-chain-voucher-encoding}}).
    These bytes are the exact message verified by
    Solana's native `ed25519` precompile and read back
@@ -302,7 +302,7 @@ logical fields:
 | `distributionHash` | [u8;32] | Account state | Hash digest of the canonical splits preimage committed at `open`; `distribute` MUST re-verify this hash before paying recipients |
 | `payer` | Pubkey | Seed + Account state | Client who deposited funds |
 | `payee` | Pubkey | Seed + Account state | Server authorized to settle; receives the implicit-remainder share on `distribute` |
-| `authorizedSigner` | Pubkey | Seed + Account state | Voucher signer (payer if not delegated) |
+| `authorizedSigner` | Pubkey | Seed + Account state | Voucher signer; MAY equal `payer` or a delegated signer |
 | `mint` | Pubkey | Seed + Account state | SPL Token or Token-2022 mint. Stored (not seed-only) so refund / distribution CPIs can be validated without re-binding seeds |
 
 The `channelId` is the base58-encoded address of the
@@ -318,6 +318,10 @@ set MUST bind the PDA to:
 - a client-chosen salt or nonce; and
 - the authorized signer public key (or payer if no
   delegation is used).
+
+Once a channel is opened, vouchers for that channel
+MUST verify under the channel's `authorizedSigner`.
+No other signer is valid for that channel.
 
 Clients and servers MUST derive the expected
 `channelId` from the channel program ID and the seed
@@ -368,8 +372,8 @@ voucher is exchanged off-chain after confirmation.
 ### settle
 
 Advances the on-chain `settled` watermark using a
-payer-signed voucher. Permissionless; authority is
-the voucher signature.
+voucher signed by `authorizedSigner`. Permissionless;
+authority is the voucher signature.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -656,9 +660,9 @@ Opens a new payment channel.
 | `payer` | string | REQUIRED | Base58 public key of the depositor |
 | `payee` | string | REQUIRED | Base58 public key of the channel payee (matches `recipient` in the 402 challenge) |
 | `mint` | string | REQUIRED | Base58 SPL Token / Token-2022 mint (matches `currency` in the 402 challenge) |
-| `authorizedSigner` | string | REQUIRED | Base58 public key bound into the PDA seeds as the voucher signer; equals `payer` when no delegation is used |
+| `authorizedSigner` | string | REQUIRED | Base58 public key bound into the PDA seeds as the voucher signer; MAY equal `payer` or a delegated signer |
 | `salt` | string | REQUIRED | Decimal u64 PDA disambiguator |
-| `depositAmount` | string | REQUIRED | Initial deposit in base units; MUST satisfy `depositAmount >= methodDetails.minimumDeposit` |
+| `depositAmount` | string | REQUIRED | Initial deposit in base units; MUST equal the decoded `open` deposit and satisfy `depositAmount >= methodDetails.minimumDeposit` |
 | `gracePeriodSeconds` | integer | REQUIRED | Grace-period seconds bound into channel state at `open`; MUST be greater than zero and MUST match `methodDetails.gracePeriodSeconds` (or the server-policy default) |
 | `distributionSplits` | array | OPTIONAL | Splits preimage (see `methodDetails.distributionSplits`); MUST byte-match the splits proposed in the 402 challenge |
 | `authorizationPolicy` | object | OPTIONAL | Voucher signer policy. When present, MUST be consistent with `authorizedSigner` |
@@ -692,19 +696,34 @@ is buggy can compute a wrong bump that nonetheless
 pairs with the canonical PDA address — a mismatch the
 on-chain address check cannot catch.
 
-Servers MUST derive `payer`, `channelId`,
-`depositAmount`, `gracePeriodSeconds`,
-`authorizationPolicy`, delegated signer settings, and
-the distribution splits commitment from the signed
-transaction and confirmed on-chain state. Servers MUST
-NOT trust these values solely because they appear in
-the HTTP payload. Servers MUST also strictly validate
-that the on-chain `distributionSplits`, `payee`,
-`mint`, and `gracePeriod` exactly match what was
-proposed in the 402 challenge and carried in the open
-payload; failing to do so allows a malicious client
-to redirect the merchant-side payout or shorten the
-forced-close window.
+Servers MUST treat the decoded `transaction`, not the
+HTTP envelope, as the authoritative open request
+before signing, paying fees, or broadcasting. Servers
+MUST decode the channel instruction and verify that it
+targets `methodDetails.channelProgram`, uses the
+`open` discriminator, and encodes the same `payer`,
+`payee`, `mint`, `authorizedSigner`, `salt`, `deposit`,
+`grace_period`, and canonical `distributionSplits`
+preimage carried in the credential and the 402
+challenge.
+
+Servers MUST recompute `channelId` from the decoded
+seed fields and channel program ID, verify that it
+equals both the decoded channel account and the
+payload `channelId`, and verify that the decoded
+escrow account is the associated token account for
+`(channelId, mint, tokenProgram)`. The decoded
+`tokenProgram` MUST match the challenged token program
+when one was supplied; otherwise it MUST be one of the
+supported token programs for the mint.
+
+Any disagreement between the challenge, HTTP payload,
+decoded transaction, derived PDA, escrow ATA, or
+confirmed on-chain state MUST be rejected. Failing to
+do so allows a malicious client to redirect the
+merchant-side payout, shorten the forced-close window,
+underfund escrow, or cause the server to meter a
+different channel than the one it challenged.
 
 ## Action: "voucher"
 
@@ -824,17 +843,18 @@ The server MUST verify each voucher:
 
 1. Deserialize and canonicalize the voucher data.
 
-2. Verify the Ed25519 signature against the `signer`
-   public key.
+2. Verify the Ed25519 signature over the Borsh voucher
+   payload against the `signer` public key.
 
 3. Verify the `signer` matches the channel's
-   `authorizedSigner` (or `payer` if no delegation).
+   `authorizedSigner`.
 
-4. Verify `channelId` matches the active channel.
+4. Verify `voucher.channelId` matches the active
+   channel PDA.
 
 5. Verify `cumulativeAmount > acceptedCumulative`
-   (cumulative increase), unless the submission is an
-   idempotent retry handled per
+   using the server's durable watermark, unless the
+   submission is an idempotent retry handled per
    "Concurrency and Idempotency".
 
 6. Verify the channel account discriminator is not
@@ -857,6 +877,11 @@ The server MUST verify each voucher:
 
 10. Persist the new `acceptedCumulative` amount to
     durable storage BEFORE serving the resource.
+
+The on-chain `settled` watermark is not a substitute
+for `acceptedCumulative` during metered service.
+Servers MUST reject non-increasing vouchers even when
+on-chain settlement lags behind accepted service.
 
 ## On-Chain Voucher Verification
 
@@ -1109,37 +1134,54 @@ idempotent request.
 
 ## Open
 
-1. Verify the open transaction contains the expected
-   channel program instruction (the reference
-   implementation composes channel-PDA creation,
-   escrow ATA creation, deposit transfer, and the
-   `distributionHash` commitment in a single `open`
+1. Decode the open transaction before signing, paying
+   fees, or broadcasting. Verify it contains the
+   expected channel program `open` instruction (the
+   reference implementation composes channel-PDA
+   creation, escrow ATA creation, deposit transfer,
+   and the `distributionHash` commitment in a single
    instruction).
-2. Recompute the expected PDA from the transaction's
-   payer, payee, mint, authorized signer, and salt
-   plus the channel program ID. Verify it equals the
-   declared `channelId`.
-3. Verify the credential's `gracePeriodSeconds` equals
+2. Verify the instruction targets the challenged
+   channel program and encodes the challenged `payer`,
+   `payee`, `mint`, `authorizedSigner`, `salt`,
+   `deposit`, `grace_period`, and canonical
+   `distributionSplits` preimage.
+3. Recompute the expected PDA from the decoded payer,
+   payee, mint, authorized signer, and salt plus the
+   channel program ID. Verify it equals both the
+   decoded channel account and the declared
+   `channelId`.
+4. Verify the decoded escrow account is the associated
+   token account for `(channelId, mint, tokenProgram)`.
+   If the challenge supplied `tokenProgram`, the
+   decoded token program MUST match it; otherwise it
+   MUST be a supported token program for the mint.
+5. Verify the credential's `gracePeriodSeconds` equals
    the challenge policy and is greater than zero.
    Decode the open instruction and verify its
-   `gracePeriod` equals the same value.
-4. Verify the transaction's fee payer matches the
+   `grace_period` equals the same value.
+6. Verify the transaction's fee payer matches the
    challenge policy:
    - if `feePayer` is `true`, the fee payer MUST equal
      `feePayerKey`;
    - otherwise the payer funds the transaction.
-5. Verify the transaction does not include unrelated
+7. Verify the transaction does not include unrelated
    writable accounts or instructions that could
    redirect funds or mutate channel parameters.
    The server SHOULD reject transactions that route
    value through unexpected external programs.
-6. Verify `depositAmount >= methodDetails.minimumDeposit`
-   (when set) and that the on-chain `distributionHash`
-   matches the digest of the canonical preimage of
-   the splits proposed in the 402 challenge.
-7. If fee payer mode: co-sign and broadcast.
+8. Verify the decoded `deposit` equals
+   `depositAmount`, satisfies
+   `methodDetails.minimumDeposit` (when set), and that
+   the resulting `distributionHash` matches the digest
+   of the canonical preimage of the splits proposed in
+   the 402 challenge.
+9. Reject any disagreement between the challenge,
+   credential payload, decoded transaction, derived
+   PDA, escrow ATA, or token program.
+10. If fee payer mode: co-sign and broadcast.
    Otherwise: broadcast as-is.
-8. Verify channel state on-chain after confirmation:
+11. Verify channel state on-chain after confirmation:
    - payer matches transaction signer;
    - payee matches the challenged recipient;
    - mint matches the challenge currency;
@@ -1150,8 +1192,8 @@ idempotent request.
    - `distributionHash` matches the proposed splits;
    - channel is not finalized; and
    - `closureStartedAt` is `0`.
-9. Create server-side channel state.
-10. Return 200 with receipt.
+12. Create server-side channel state.
+13. Return 200 with receipt.
 
 ## Voucher Update (No Settlement)
 
@@ -1183,8 +1225,15 @@ is requested, the paths forward are
 
 ## Close (Cooperative) {#close-cooperative}
 
-1. If a final voucher is provided, verify it (it
-   MUST strictly advance the on-chain watermark).
+1. If a final voucher is provided, verify the
+   `SignedVoucher` against the active channel:
+   `voucher.channelId` equals the payload `channelId`,
+   `signer` equals the channel `authorizedSigner`, the
+   Ed25519 signature verifies over the Borsh payload,
+   freshness checks pass, and
+   `settled < cumulativeAmount <= deposit`. The same
+   `acceptedCumulative` rules used for voucher updates
+   apply.
 2. Build and broadcast `settleAndFinalize`. The
    server SHOULD bundle `distribute` in the same
    transaction so the merchant-side payout, payer
@@ -1299,6 +1348,15 @@ channel program ID and channel open parameters so that
 vouchers cannot be replayed across different channel
 program deployments or different Solana clusters.
 
+Servers that sponsor or submit open transactions MUST
+treat the decoded transaction contents as the
+committed request. A malicious client can otherwise
+present a benign HTTP envelope while embedding a
+different payee, distribution split, deposit, signer,
+channel PDA, or grace period. Such a mismatch can make
+the server sponsor or meter a channel it did not
+challenge.
+
 ## Cumulative Amount Safety
 
 Vouchers authorize cumulative totals (not deltas).
@@ -1316,9 +1374,10 @@ to submit any outstanding vouchers.
 
 Servers MUST verify that a new channel uses the
 challenged `gracePeriodSeconds`. If the transaction
-sets a zero or shorter grace period, the payer could
-request close and recover funds before the server has
-time to settle accepted vouchers.
+sets a zero, shorter, or envelope-disagreeing
+`grace_period`, the payer could request close and
+recover funds before the server has time to settle
+accepted vouchers.
 
 Because `topUp` MUST NOT clear `closureStartedAt`,
 servers MUST guard the equivalent grief vector at
