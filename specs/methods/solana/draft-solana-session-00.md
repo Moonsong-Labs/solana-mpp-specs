@@ -364,9 +364,7 @@ allow-list (see {{token-extension-policy}}) MUST be
 rejected.
 
 The `gracePeriod` parameter MUST be non-zero. Channel
-programs MUST reject `grace_period == 0`. The
-reference program reports `GracePeriodMustBeNonZero`
-(code `201`) for this rejection.
+programs MUST reject `grace_period == 0`.
 
 `open` does NOT carry an initial voucher; the first
 voucher is exchanged off-chain after confirmation.
