@@ -300,7 +300,7 @@ program source.
 | `salt` | u64 | Seed + Account state | PDA disambiguator. Persisted so the channel PDA can re-derive its own seeds for self-signed CPIs (refunds, distribution) without off-chain inputs |
 | `deposit` | u64 | Account state | Total amount currently escrowed |
 | `settled` | u64 | Account state | Cumulative amount authorized for distribution (voucher watermark) |
-| `paidOut` | u64 | Account state | Cumulative amount already distributed to the merchant side; `paidOut <= settled` |
+| `payoutWatermark` | u64 | Account state | Distribution watermark (`payoutWatermark <= settled`); `distribute` advances it to `settled` and pays cumulative floor deltas between the old and new watermark (see {{splits-canonicalization}}) |
 | `closureStartedAt` | i64 | Account state | Unix timestamp when `requestClose` was called (0 if not set; cleared on `Finalized`) |
 | `payerWithdrawnAt` | i64 | Account state | Unix timestamp of the payer refund (0 if not yet); guards against double-refund when both `withdrawPayer` and `distribute` can pay the payer |
 | `gracePeriod` | u32 | Account state | Non-zero seconds between `requestClose` and permissionless `finalize`. Per-channel, set at `open`, so a single program deployment can host channels with differing dispute windows |
@@ -341,6 +341,16 @@ derivation procedure and MUST reject non-canonical
 addresses or user-supplied bump values that do not
 match the canonical derivation for the channel seeds.
 
+`Channel` state — `deposit`, `settled`,
+`payoutWatermark`, and `payerWithdrawnAt` — is
+authoritative for pending settlement value. The escrow
+ATA balance and the channel PDA's lamports can exceed
+those values, because third parties can prefund either
+address; the program does not record those surpluses in
+`Channel`. Off-chain consumers MUST derive spendable
+capacity and pending settlement from channel state,
+never from raw escrow ATA balances or PDA lamports.
+
 ## Instructions
 
 ### open
@@ -371,6 +381,25 @@ rejected.
 
 The `gracePeriod` parameter MUST be non-zero. Channel
 programs MUST reject `grace_period == 0`.
+
+`open` does NOT curve-check `payee`; both on-curve and
+PDA payees are permitted (see {{settle-and-finalize}}).
+
+`open` is prefund-tolerant. The channel PDA allocation
+and the escrow ATA creation are both idempotent: a
+prefunded but still-uninitialized channel PDA (a
+system-owned, data-empty account holding only lamports)
+or a pre-existing canonical escrow ATA is accepted
+rather than reverting. Prefunded balances are never
+credited to channel state — surplus PDA lamports refund
+to the payer at tombstone, and surplus escrow tokens are
+swept to the treasury at `finalize`.
+
+Servers MUST use a `salt` unique per channel. Reusing
+the `(payer, payee, mint, authorizedSigner, salt)` tuple
+of an already-open channel reverts `open` (the PDA
+already holds an initialized `Channel`); resume that
+channel instead of reopening it.
 
 `open` does NOT carry an initial voucher; the first
 voucher is exchanged off-chain after confirmation.
@@ -424,7 +453,7 @@ Permissionless post-grace crank. Transitions
 `closureStartedAt`, and freezes `settled`. No
 token transfer occurs.
 
-### settleAndFinalize
+### settleAndFinalize {#settle-and-finalize}
 
 Payee-initiated cooperative close. Optionally
 applies one final voucher (using the same
@@ -441,6 +470,15 @@ and from `Closing` while `now < closureStartedAt + gracePeriod`;
 after the grace deadline use `finalize` instead. No
 token transfer occurs.
 
+The `payee` MAY be an on-curve address or a
+program-derived address (PDA). Because cooperative
+close requires a transaction signer equal to
+`Channel.payee`, a PDA payee can use this path only
+when its owning program invokes `settleAndFinalize`
+via CPI with signer seeds. The permissionless
+`settle`, `finalize`, and `distribute` cranks need no
+payee signature.
+
 ### distribute
 
 Pays the merchant-side pool out of escrow according
@@ -455,25 +493,57 @@ commitment.
 Recipient token accounts are supplied as the dynamic
 account tail, in the same order as the preimage
 entries. Each MUST be the canonical ATA for
-`(recipient, channel.mint, channel.tokenProgram)`.
+`(recipient, channel.mint, channel.tokenProgram)`. A
+`distribute` carrying enough recipient accounts to
+exceed the legacy transaction account-key budget — in
+practice at `MAX_DISTRIBUTION_RECIPIENTS` recipients
+(RECOMMENDED 32) — MUST be sent as a version-0
+transaction with an address lookup table indexing the
+recipient ATAs.
 
-For `pool = settled - paidOut`:
+Each beneficiary is paid a cumulative floor delta
+keyed to `payoutWatermark`:
 
-- recipient `i`: `floor(pool * bps[i] / 10000)`;
-- payee: `floor(pool * (10000 - Σ bps) / 10000)`.
+- recipient `i`:
+  `floor(settled * shareBps[i] / 10000) − floor(payoutWatermark * shareBps[i] / 10000)`;
+- payee (implicit remainder):
+  `floor(settled * (10000 − Σ shareBps) / 10000) − floor(payoutWatermark * (10000 − Σ shareBps) / 10000)`.
 
-`paidOut` is incremented by the total distributed.
+`distribute` then advances `payoutWatermark` to
+`settled`.
 
-From `Open`, `distribute` requires `pool > 0`,
-leaves flooring residual in the escrow ATA, and
-keeps the channel `Open`. From `Finalized`,
+From `Open`, `distribute` requires
+`settled > payoutWatermark`, pays the cumulative floor
+deltas, leaves flooring-residual dust in the escrow
+ATA, advances `payoutWatermark` to `settled`, and keeps
+the channel `Open`; later distributions compute fresh
+deltas from the advanced watermark, so residual value
+remains claimable as a share's cumulative entitlement
+crosses the next whole unit. From `Finalized`,
 `distribute` additionally — when
 `payerWithdrawnAt == 0` — transfers
 `deposit - settled` to the payer, stamps
-`payerWithdrawnAt`, sweeps residual to the treasury
-ATA, closes the escrow ATA, and tombstones the
-channel PDA (see {{tombstoning}}). `distribute`
-MUST NOT be callable from `Closing`.
+`payerWithdrawnAt`, sweeps the final irreducible
+residual dust to the treasury ATA, closes the escrow
+ATA, and tombstones the channel PDA (see
+{{tombstoning}}). `distribute` MUST NOT be callable
+from `Closing`.
+
+On a nonzero beneficiary share whose canonical ATA is
+unusable — missing or uninitialized, frozen, closed or
+malformed, carrying an unsupported Token-2022 account
+extension, or with a reassigned authority — that share
+is redirected to the treasury ATA, a `PayoutRedirected`
+event is emitted, and `payoutWatermark` still advances.
+The beneficiary permanently forfeits that share;
+repairing the ATA later does not reclaim it, because
+future deltas only cover newly settled amounts. The
+same redirect applies to the payer refund ATA at
+`Finalized` (finalization tombstones the channel in the
+same instruction, so there is no later crank to
+reclaim). Malformed token-account data and wrong
+(non-canonical) accounts hard-fail rather than
+redirecting.
 
 ### withdrawPayer
 
@@ -525,6 +595,24 @@ sweep funds before the server has time to settle.
 | distribute | Anyone (permissionless crank) | On-chain hash commitment to splits preimage |
 | withdrawPayer | Payer | Payer signer equals channel `payer` and `status == Finalized` |
 
+## Account Shapes and Events
+
+Every instruction takes an exact account list and
+rejects transactions with missing OR extra accounts.
+The only dynamic account tail is `distribute`'s
+recipient token accounts (one canonical ATA per active
+preimage entry, in preimage order). Conforming
+generated clients enforce the same shapes, so callers
+cannot pad an instruction with unexpected accounts.
+
+The channel program declares two events in its IDL:
+`Opened` (emitted by `open`) and `PayoutRedirected`
+(emitted by `distribute` when a beneficiary share is
+redirected to the treasury; see {{payout-forfeiture}}).
+Each event carries an 8-byte discriminator so
+IDL-driven indexers can decode it without custom
+tooling.
+
 # Request Schema
 
 ## Shared Fields
@@ -573,14 +661,17 @@ externalId
 ## Method Details
 
 network
-: OPTIONAL. Solana cluster identifier. MUST be one of
-  "mainnet-beta", "devnet", or "localnet". Defaults to
-  "mainnet-beta".
+: REQUIRED. Solana cluster identifier. MUST be one of
+  "mainnet-beta", "devnet", "testnet", or "localnet".
+  There is no default; the challenge MUST state the
+  cluster explicitly.
 
 channelProgram
 : REQUIRED. Base58-encoded address of the on-chain
-  channel program. Clients MUST verify this matches
-  their expected program before depositing funds.
+  channel program, which MUST be the program explicitly
+  deployed for the selected `network`. Clients MUST
+  verify this matches their expected program for that
+  cluster before depositing funds.
 
 channelId
 : OPTIONAL. Existing channel identifier to resume. When
@@ -792,16 +883,26 @@ procedure, including how `settleAndFinalize` and
 | `channelId` | string | REQUIRED | Channel this voucher authorizes |
 | `cumulativeAmount` | string | REQUIRED | Total authorized spend (base units) |
 | `expiresAt` | integer | OPTIONAL | Voucher expiration as a Unix timestamp in seconds (i64); `0` or omitted means no expiration. Encoded verbatim into the signed Borsh payload (see {{on-chain-voucher-encoding}}); no string/timezone conversion is performed at sign or verify time. |
+| `chainId` | string | REQUIRED | Base58 cluster genesis hash binding this voucher to a single Solana cluster; MUST equal the channel program's on-chain `CHAIN_ID` |
 
 All other channel context (payer, recipient, token,
-network, program, and signer policy) is established
-by the on-chain channel state and the deterministic
-PDA derivation defined above. The voucher only needs
-to identify the channel and authorize a cumulative
-amount because `channelId` is already bound to that
-context. Implementations MUST NOT accept vouchers for
-channels whose identity cannot be recomputed from the
-program ID and channel open parameters.
+program, and signer policy) is established by the
+on-chain channel state and the deterministic PDA
+derivation defined above. The voucher only needs to
+identify the channel and authorize a cumulative amount
+because `channelId` is already bound to that context.
+Implementations MUST NOT accept vouchers for channels
+whose identity cannot be recomputed from the program ID
+and channel open parameters.
+
+The voucher additionally carries `chainId` because the
+channel PDA address is unique only within a single
+cluster: the same channel program and seeds on another
+cluster derive an identically-addressed channel.
+Binding each voucher to the cluster genesis hash
+prevents a voucher signed for one cluster from being
+replayed against an identically-addressed channel on
+another.
 
 ## Signed Voucher
 
@@ -814,7 +915,7 @@ program ID and channel open parameters.
 
 ## Voucher Signing {#on-chain-voucher-encoding}
 
-The signed voucher payload is 48 bytes in fixed
+The signed voucher payload is 80 bytes in fixed
 Borsh layout:
 
 | Offset | Length | Field | Encoding |
@@ -822,10 +923,13 @@ Borsh layout:
 | 0 | 32 | `channelId` | Raw Solana address bytes |
 | 32 | 8 | `cumulativeAmount` | u64 little-endian |
 | 40 | 8 | `expiresAt` | i64 little-endian; `0` = no expiration |
+| 48 | 32 | `chainId` | Raw cluster genesis-hash bytes |
 
 Signing:
 
-1. Serialize the voucher data into the layout above.
+1. Serialize the voucher data — including `chainId` set
+   to the target cluster's genesis hash — into the
+   layout above.
 2. Sign with Ed25519 using `authorizedSigner`'s key.
 3. Encode the signature as base58 for the HTTP
    `signature` field.
@@ -852,33 +956,47 @@ The server MUST verify each voucher:
 4. Verify `voucher.channelId` matches the active
    channel PDA.
 
-5. Verify `cumulativeAmount > acceptedCumulative`
+5. Verify `voucher.chainId` equals the cluster
+   `CHAIN_ID` (the genesis hash the channel program is
+   built for). Reject vouchers whose `chainId` does not
+   match; this mirrors the on-chain chain-binding check
+   and rejects cross-cluster-replayed vouchers before
+   the server pays fees.
+
+6. Verify `cumulativeAmount > acceptedCumulative`
    using the server's durable watermark, even when
    on-chain `settled` lags. Equal or lower amounts
    MUST be rejected for metered voucher acceptance
    unless they are exact idempotent replays handled
-   per "Concurrency and Idempotency".
+   per "Concurrency and Idempotency". The accepted
+   increment `cumulativeAmount − acceptedCumulative`
+   MUST correspond to the resource cost charged for the
+   accompanying request, not merely be a positive
+   advance.
 
-6. Verify the channel account discriminator is not
+7. Verify the channel account discriminator is not
    `ClosedChannel` (i.e., the channel has not been
    tombstoned by `distribute`).
 
-7. Verify `status == Open` (i.e., `closureStartedAt == 0`
+8. Verify `status == Open` (i.e., `closureStartedAt == 0`
    and the channel has not yet been finalized).
    Servers MUST reject new voucher acceptance on
    channels with a pending forced close unless the
    voucher is being used only to drive
    `settleAndFinalize`.
 
-8. Verify `cumulativeAmount <= escrowedAmount` (does
+9. Verify `cumulativeAmount <= escrowedAmount` (does
    not exceed deposit).
 
-9. If `expiresAt` is present and non-zero, verify
-   `now < expiresAt` (with configurable clock skew
-   tolerance).
+10. If `expiresAt` is present and non-zero, verify
+    `now < expiresAt` (with configurable clock skew
+    tolerance).
 
-10. Persist the new `acceptedCumulative` amount to
-    durable storage BEFORE serving the resource.
+11. Persist the new `acceptedCumulative` amount AND the
+    full `SignedVoucher` to durable storage BEFORE
+    serving the resource. The numeric watermark alone is
+    insufficient: on-chain `settle` / `settleAndFinalize`
+    require the stored signed payload.
 
 ## On-Chain Voucher Verification
 
@@ -915,6 +1033,10 @@ programs MUST:
   precompile recorded MUST byte-equal the channel
   instruction's voucher argument, and the precompile-
   recorded signer MUST equal `authorizedSigner`;
+- verify the voucher's `chainId` equals this cluster's
+  `CHAIN_ID` (genesis hash) and reject otherwise, so a
+  voucher signed for one cluster cannot be replayed
+  against an identically-addressed channel on another;
 - reject signature-verification instructions that are
   replayed, unrelated, or positioned such that the
   channel program cannot unambiguously determine which
@@ -960,15 +1082,23 @@ compatibility.
 
 ## Distribution Math
 
-For `pool = settled − paidOut`:
+`distribute` pays each beneficiary the cumulative
+floor delta between `payoutWatermark` and `settled`:
 
-- recipient `i`: `floor(pool * shareBps[i] / 10000)`;
-- payee: `floor(pool * (10000 − Σ shareBps) / 10000)`.
+- recipient `i`:
+  `floor(settled * shareBps[i] / 10000) − floor(payoutWatermark * shareBps[i] / 10000)`;
+- payee:
+  `floor(settled * (10000 − Σ shareBps) / 10000) − floor(payoutWatermark * (10000 − Σ shareBps) / 10000)`.
 
-Flooring residual remains in the escrow ATA while
-`status == Open`. At the `Finalized` branch of
-`distribute`, residual is swept to the protocol
-treasury ATA before the escrow ATA is closed.
+During `status == Open`, flooring-residual dust remains
+in the escrow ATA while `payoutWatermark` advances to
+`settled`; because later distributions compute deltas
+from that watermark, previously residual value stays
+claimable once a share's cumulative entitlement crosses
+the next whole unit. At the `Finalized` branch of
+`distribute`, the final cumulative delta runs once,
+then the irreducible residual dust is swept to the
+protocol treasury ATA before the escrow ATA is closed.
 The treasury account is a deployment-level address
 documented out of band by the channel program.
 
@@ -978,6 +1108,12 @@ By default, the payer signs vouchers directly. This
 matches the default channel model: the funding key is
 also the voucher-signing key, and the deposit is the
 hard cap enforced by the channel.
+
+Whether the voucher signer is the payer or a delegated
+key, it MUST be a valid Ed25519 public-key point.
+`open` MUST reject an `authorizedSigner` that is not a
+curve point, since a non-curve value could never
+produce a verifiable voucher signature.
 
 Implementations MAY support delegated signing where
 the payer authorizes a separate keypair (for example,
@@ -1031,14 +1167,27 @@ each open channel:
 | Field | Description |
 |-------|-------------|
 | `channelId` | Channel account address |
+| `chainId` | Cluster genesis hash; part of the channel's durable key |
 | `status` | `"open"` or `"closed"` |
 | `payer` | Payer public key |
 | `authorizationPolicy` | Voucher signer policy |
-| `escrowedAmount` | Total deposited (from on-chain) |
+| `escrowedAmount` | Total deposited (from on-chain `Channel.deposit`) |
 | `acceptedCumulative` | Highest voucher amount accepted |
+| `highestVoucher` | Full highest accepted `SignedVoucher`, retained for on-chain settlement |
 | `spentAmount` | Cumulative amount charged for delivered service |
 | `settledOnChain` | Highest cumulative amount already settled on-chain |
 | `closureStartedAt` | Pending forced-close timestamp, if any |
+
+Server-side channel state — in particular
+`acceptedCumulative` and the stored highest
+`SignedVoucher` — MUST be keyed by the pair
+`(channelId, chainId)`, not by `channelId`, challenge
+id, or HTTP session id alone. The channel PDA is unique
+only within a cluster; the same program and seeds on
+another cluster derive an identically-addressed
+channel, so `chainId` disambiguates same-address
+channels across clusters and keeps each cluster's
+cumulative ledger separate.
 
 The available off-chain balance is computed as:
 
@@ -1051,6 +1200,27 @@ The on-chain settlement watermark is distinct:
 ~~~
 unsettled = spentAmount - settledOnChain
 ~~~
+
+## Mint Allow-List {#mint-allow-list}
+
+Servers MUST restrict a channel's `mint` to an
+explicit, server-controlled allow-list of vetted mints,
+curated out of band and never derived from
+client-supplied data. The server MUST set the 402
+challenge `currency` only to an allow-listed mint and
+MUST reject any `open` whose decoded `mint` is not on
+the list. Because the open-validation binding in
+{{open-settlement}} ties the decoded `open` mint to the
+challenged `currency`, no off-list mint can enter a new
+channel.
+
+The server SHOULD refuse to resume or `topUp` a channel
+whose `mint` has since been delisted.
+
+This requirement exists because the channel program
+does not inspect a mint's freeze or mint authority (see
+{{escrow-safety}}); the server is the only gate that
+keeps unvetted mints out of channels.
 
 ## Debit Processing
 
@@ -1101,9 +1271,9 @@ or machine crashes.
 ## Concurrency and Idempotency
 
 Servers MUST serialize voucher acceptance and debit
-processing per `channelId`. Voucher updates arriving
-on different HTTP connections or multiplexed streams
-MUST be processed atomically with respect to:
+processing per `(channelId, chainId)`. Voucher updates
+arriving on different HTTP connections or multiplexed
+streams MUST be processed atomically with respect to:
 
 - `acceptedCumulative`;
 - `spentAmount`; and
@@ -1143,7 +1313,10 @@ idempotent request.
    channel program and encodes the challenged `payer`,
    `payee`, `mint`, `authorizedSigner`, `salt`,
    `deposit`, `grace_period`, and canonical
-   `distributionSplits` preimage.
+   `distributionSplits` preimage. The decoded
+   `authorizedSigner` MUST equal the credential's
+   `authorizedSigner` and MUST be a valid Ed25519
+   public-key point; reject non-curve values.
 3. Recompute the expected PDA from the decoded payer,
    payee, mint, authorized signer, and salt plus the
    channel program ID. Verify it equals both the
@@ -1163,11 +1336,16 @@ idempotent request.
    - if `feePayer` is `true`, the fee payer MUST equal
      `feePayerKey`;
    - otherwise the payer funds the transaction.
-7. Verify the transaction does not include unrelated
-   writable accounts or instructions that could
-   redirect funds or mutate channel parameters.
-   The server SHOULD reject transactions that route
-   value through unexpected external programs.
+7. Validate the complete compiled message — resolving
+   any version-0 address-lookup-table entries — not just
+   the channel instruction. Verify the transaction does
+   not include unrelated writable accounts or
+   instructions that could redirect funds or mutate
+   channel parameters, and that the server fee payer is
+   never used as an authority, source, or writable
+   account by any instruction. The server SHOULD reject
+   transactions that route value through unexpected
+   external programs.
 8. Verify the decoded `deposit` equals
    `depositAmount`, satisfies
    `methodDetails.minimumDeposit` (when set), and that
@@ -1192,6 +1370,22 @@ idempotent request.
    - `closureStartedAt` is `0`.
 12. Create server-side channel state.
 13. Return 200 with receipt.
+
+## Resume
+
+When a challenge resumes an existing channel
+(`methodDetails.channelId`), the server MUST
+re-authenticate the on-chain account before metering
+against it — decoding the account bytes is not
+sufficient. The server MUST verify the account is owned
+by the channel program and that its discriminator,
+`version`, `status == Open`, PDA derivation, `mint`
+(still allow-listed), `payee`, `authorizedSigner`, and
+`distributionHash` all match the active challenge and
+session. A resumed channel shares one cumulative ledger
+across challenges, keyed by `(channelId, chainId)`, so a
+single cumulative voucher cannot be reused to buy
+multiple responses.
 
 ## Voucher Update (No Settlement)
 
@@ -1234,13 +1428,24 @@ is requested, the paths forward are
    server SHOULD bundle `distribute` in the same
    transaction so the merchant-side payout, payer
    refund, treasury sweep, and PDA tombstone all
-   land atomically.
+   land atomically. A bundle whose `distribute`
+   carries many recipients may require a version-0
+   transaction with an address lookup table.
 3. Mark the channel as `"closed"` in server-side
    state.
 4. Persist final `settledOnChain` and terminal
    accounting state after confirmation.
 5. Return 200 with receipt containing `txHash` and
    (if `distribute` ran) the refunded amount.
+
+For deployments whose `payee` is a PDA, the server MUST
+provide a working CPI signer-seed adapter for
+`settleAndFinalize` before opening channels, or else
+refuse the channel before metering begins. A PDA payee
+with no cooperative-close path can leave delivered
+service uncollectible: the permissionless `settle` crank
+cannot apply a new voucher once `requestClose` has moved
+the channel to `Closing`.
 
 ## Forced Close (Client-Initiated)
 
@@ -1323,13 +1528,54 @@ All error responses MUST include a fresh challenge in
 
 All communication MUST use TLS 1.2 or higher.
 
-## Escrow Safety
+## Escrow Safety {#escrow-safety}
 
 Funds are held by the channel program, not the
 server. The server can only claim funds by presenting
 valid voucher signatures to the program. The client
 can always recover unspent funds via forced close
 after the grace period.
+
+The channel program intentionally does NOT inspect a
+mint's freeze authority or mint authority.
+Hard-rejecting any mint with a live freeze authority
+would exclude most real-world stablecoins (USDC, USDT,
+PYUSD, EURC), all of which retain an issuer-controlled
+freeze authority. The cost of allowing them is that a
+live freeze authority can freeze the escrow ATA at any
+point in the channel lifecycle; once frozen, every
+value-moving instruction (`topUp`, `distribute`,
+`withdrawPayer`) rejects, wedging both the merchant
+payout leg and the payer refund leg with no
+permissionless crank to unwind it until the authority
+thaws. The trust decision is therefore pushed
+off-chain: a merchant accepting payments in mint `M`
+implicitly accepts that `M`'s freeze authority can
+wedge any channel denominated in `M`, and SHOULD
+allow-list (see {{mint-allow-list}}) only mints whose
+freeze and mint authorities it considers acceptably
+governed. This mint-issuer trust model is distinct from
+the Token-2022 *extension* allow-list in
+{{token-extension-policy}}.
+
+## Payout Forfeiture {#payout-forfeiture}
+
+`distribute` never blocks on an unusable beneficiary
+account. A nonzero share whose canonical ATA is
+missing, frozen, closed, malformed, carries an
+unsupported Token-2022 account extension, or has a
+reassigned authority is redirected to the treasury ATA
+and `payoutWatermark` advances regardless, so the
+beneficiary permanently forfeits that share — later
+repair cannot reclaim it. The same applies to the payer
+refund ATA at `Finalized`. This removes a griefing
+vector (a single poisoned ATA cannot stall payouts to
+the rest of the channel) at the cost of forfeitable
+funds. Operators SHOULD ensure recipient, payee, and
+payer ATAs exist and are healthy (initialized,
+unfrozen, canonical, extension-clean) — or withdraw the
+payer headroom via `withdrawPayer` beforehand — before
+cranking `distribute`.
 
 ## Voucher Replay Protection
 
@@ -1339,10 +1585,16 @@ from one channel
 cannot be replayed in another.
 
 This replay protection depends on deterministic PDA
-derivation. The channel address MUST be bound to the
+derivation together with the voucher's `chainId`
+binding. The channel address MUST be bound to the
 channel program ID and channel open parameters so that
 vouchers cannot be replayed across different channel
-program deployments or different Solana clusters.
+program deployments. Because the same program and seeds
+derive an identically-addressed channel on another
+cluster, each voucher additionally carries the cluster
+genesis hash in `chainId` (see {{voucher-format}}), and
+verifiers MUST reject a voucher whose `chainId` does not
+match the local cluster.
 
 ## Open Transaction Binding
 
