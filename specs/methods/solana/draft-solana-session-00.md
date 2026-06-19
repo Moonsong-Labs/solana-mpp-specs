@@ -883,7 +883,6 @@ procedure, including how `settleAndFinalize` and
 | `channelId` | string | REQUIRED | Channel this voucher authorizes |
 | `cumulativeAmount` | string | REQUIRED | Total authorized spend (base units) |
 | `expiresAt` | integer | OPTIONAL | Voucher expiration as a Unix timestamp in seconds (i64); `0` or omitted means no expiration. Encoded verbatim into the signed Borsh payload (see {{on-chain-voucher-encoding}}); no string/timezone conversion is performed at sign or verify time. |
-| `chainId` | string | REQUIRED | Base58 cluster genesis hash binding this voucher to a single Solana cluster; MUST equal the channel program's on-chain `CHAIN_ID` |
 
 All other channel context (payer, recipient, token,
 program, and signer policy) is established by the
@@ -894,15 +893,6 @@ because `channelId` is already bound to that context.
 Implementations MUST NOT accept vouchers for channels
 whose identity cannot be recomputed from the program ID
 and channel open parameters.
-
-The voucher additionally carries `chainId` because the
-channel PDA address is unique only within a single
-cluster: the same channel program and seeds on another
-cluster derive an identically-addressed channel.
-Binding each voucher to the cluster genesis hash
-prevents a voucher signed for one cluster from being
-replayed against an identically-addressed channel on
-another.
 
 ## Signed Voucher
 
@@ -915,7 +905,7 @@ another.
 
 ## Voucher Signing {#on-chain-voucher-encoding}
 
-The signed voucher payload is 80 bytes in fixed
+The signed voucher payload is 48 bytes in fixed
 Borsh layout:
 
 | Offset | Length | Field | Encoding |
@@ -923,13 +913,10 @@ Borsh layout:
 | 0 | 32 | `channelId` | Raw Solana address bytes |
 | 32 | 8 | `cumulativeAmount` | u64 little-endian |
 | 40 | 8 | `expiresAt` | i64 little-endian; `0` = no expiration |
-| 48 | 32 | `chainId` | Raw cluster genesis-hash bytes |
 
 Signing:
 
-1. Serialize the voucher data — including `chainId` set
-   to the target cluster's genesis hash — into the
-   layout above.
+1. Serialize the voucher data into the layout above.
 2. Sign with Ed25519 using `authorizedSigner`'s key.
 3. Encode the signature as base58 for the HTTP
    `signature` field.
@@ -956,14 +943,7 @@ The server MUST verify each voucher:
 4. Verify `voucher.channelId` matches the active
    channel PDA.
 
-5. Verify `voucher.chainId` equals the cluster
-   `CHAIN_ID` (the genesis hash the channel program is
-   built for). Reject vouchers whose `chainId` does not
-   match; this mirrors the on-chain chain-binding check
-   and rejects cross-cluster-replayed vouchers before
-   the server pays fees.
-
-6. Verify `cumulativeAmount > acceptedCumulative`
+5. Verify `cumulativeAmount > acceptedCumulative`
    using the server's durable watermark, even when
    on-chain `settled` lags. Equal or lower amounts
    MUST be rejected for metered voucher acceptance
@@ -974,25 +954,25 @@ The server MUST verify each voucher:
    accompanying request, not merely be a positive
    advance.
 
-7. Verify the channel account discriminator is not
+6. Verify the channel account discriminator is not
    `ClosedChannel` (i.e., the channel has not been
    tombstoned by `distribute`).
 
-8. Verify `status == Open` (i.e., `closureStartedAt == 0`
+7. Verify `status == Open` (i.e., `closureStartedAt == 0`
    and the channel has not yet been finalized).
    Servers MUST reject new voucher acceptance on
    channels with a pending forced close unless the
    voucher is being used only to drive
    `settleAndFinalize`.
 
-9. Verify `cumulativeAmount <= escrowedAmount` (does
+8. Verify `cumulativeAmount <= escrowedAmount` (does
    not exceed deposit).
 
-10. If `expiresAt` is present and non-zero, verify
-    `now < expiresAt` (with configurable clock skew
-    tolerance).
+9. If `expiresAt` is present and non-zero, verify
+   `now < expiresAt` (with configurable clock skew
+   tolerance).
 
-11. Persist the new `acceptedCumulative` amount AND the
+10. Persist the new `acceptedCumulative` amount AND the
     full `SignedVoucher` to durable storage BEFORE
     serving the resource. The numeric watermark alone is
     insufficient: on-chain `settle` / `settleAndFinalize`
@@ -1033,10 +1013,6 @@ programs MUST:
   precompile recorded MUST byte-equal the channel
   instruction's voucher argument, and the precompile-
   recorded signer MUST equal `authorizedSigner`;
-- verify the voucher's `chainId` equals this cluster's
-  `CHAIN_ID` (genesis hash) and reject otherwise, so a
-  voucher signed for one cluster cannot be replayed
-  against an identically-addressed channel on another;
 - reject signature-verification instructions that are
   replayed, unrelated, or positioned such that the
   channel program cannot unambiguously determine which
@@ -1167,7 +1143,6 @@ each open channel:
 | Field | Description |
 |-------|-------------|
 | `channelId` | Channel account address |
-| `chainId` | Cluster genesis hash; part of the channel's durable key |
 | `status` | `"open"` or `"closed"` |
 | `payer` | Payer public key |
 | `authorizationPolicy` | Voucher signer policy |
@@ -1180,14 +1155,8 @@ each open channel:
 
 Server-side channel state — in particular
 `acceptedCumulative` and the stored highest
-`SignedVoucher` — MUST be keyed by the pair
-`(channelId, chainId)`, not by `channelId`, challenge
-id, or HTTP session id alone. The channel PDA is unique
-only within a cluster; the same program and seeds on
-another cluster derive an identically-addressed
-channel, so `chainId` disambiguates same-address
-channels across clusters and keeps each cluster's
-cumulative ledger separate.
+`SignedVoucher` — MUST be keyed by `channelId`, not by
+challenge id or HTTP session id.
 
 The available off-chain balance is computed as:
 
@@ -1271,7 +1240,7 @@ or machine crashes.
 ## Concurrency and Idempotency
 
 Servers MUST serialize voucher acceptance and debit
-processing per `(channelId, chainId)`. Voucher updates
+processing per `channelId`. Voucher updates
 arriving on different HTTP connections or multiplexed
 streams MUST be processed atomically with respect to:
 
@@ -1383,7 +1352,7 @@ by the channel program and that its discriminator,
 (still allow-listed), `payee`, `authorizedSigner`, and
 `distributionHash` all match the active challenge and
 session. A resumed channel shares one cumulative ledger
-across challenges, keyed by `(channelId, chainId)`, so a
+across challenges, keyed by `channelId`, so a
 single cumulative voucher cannot be reused to buy
 multiple responses.
 
@@ -1585,16 +1554,10 @@ from one channel
 cannot be replayed in another.
 
 This replay protection depends on deterministic PDA
-derivation together with the voucher's `chainId`
-binding. The channel address MUST be bound to the
+derivation. The channel address MUST be bound to the
 channel program ID and channel open parameters so that
 vouchers cannot be replayed across different channel
-program deployments. Because the same program and seeds
-derive an identically-addressed channel on another
-cluster, each voucher additionally carries the cluster
-genesis hash in `chainId` (see {{voucher-format}}), and
-verifiers MUST reject a voucher whose `chainId` does not
-match the local cluster.
+program deployments.
 
 ## Open Transaction Binding
 
