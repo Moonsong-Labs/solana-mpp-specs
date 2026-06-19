@@ -1158,6 +1158,13 @@ Server-side channel state — in particular
 `SignedVoucher` — MUST be keyed by `channelId`, not by
 challenge id or HTTP session id.
 
+The channel program does not bind vouchers to a
+cluster, so operators MUST pin each server and channel
+to a single cluster and RPC endpoint and MUST NOT share
+one metering ledger across clusters. A server SHOULD
+verify the resolved channel matches the challenge's
+`methodDetails.network` before metering.
+
 The available off-chain balance is computed as:
 
 ~~~
@@ -1558,6 +1565,13 @@ derivation. The channel address MUST be bound to the
 channel program ID and channel open parameters so that
 vouchers cannot be replayed across different channel
 program deployments.
+
+Vouchers are not bound to a cluster; the same program
+and seeds derive an identically-addressed channel on
+another cluster, so a voucher could in principle be
+replayed there. This residual cross-cluster replay is
+an accepted operational risk, mitigated off-chain by
+pinning each server and channel to a single cluster.
 
 ## Open Transaction Binding
 
